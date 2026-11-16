@@ -19,7 +19,11 @@ os.environ["BATTERY_DB_PATH"] = _DB
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from app.main import app  # noqa: E402
+from app.main import app, db as app_db  # noqa: E402
+
+# When the full suite runs, another module may import first and pin the
+# app database path; read the path the app actually opened.
+DB_FILE = app_db.db_path
 
 
 def csv_text(rows, header="timestamp,current\n"):
@@ -249,7 +253,7 @@ class ConcurrencyTests(unittest.TestCase):
         # every committed version must be internally consistent
         import sqlite3
 
-        conn = sqlite3.connect(os.environ["BATTERY_DB_PATH"])
+        conn = sqlite3.connect(DB_FILE)
         rows = conn.execute(
             "SELECT v.version, v.total_cycles, COUNT(c.cycle_no) FROM"
             " report_versions v LEFT JOIN cycles c"
@@ -292,7 +296,7 @@ class ConcurrencyTests(unittest.TestCase):
         # stored value at ts=10 must be the original 1.0 A
         import sqlite3
 
-        conn = sqlite3.connect(os.environ["BATTERY_DB_PATH"])
+        conn = sqlite3.connect(DB_FILE)
         val = conn.execute(
             "SELECT current_ma FROM samples WHERE cell_id=? AND ts=10", (cell,)
         ).fetchone()[0]

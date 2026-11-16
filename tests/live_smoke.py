@@ -2,7 +2,9 @@
 
 Runs against an already-started uvicorn (default http://127.0.0.1:8000).
 Covers: late-point rewrite/renumbering, gap truncation, idempotency and
-conflict rejection, and concurrent uploads/queries with snapshot consistency.
+conflict rejection, batch id return, batch revocation (shared samples,
+repeat revocation, unknown batch) and concurrent uploads/revocations/queries
+with snapshot consistency.
 """
 
 import concurrent.futures
@@ -64,10 +66,14 @@ def main():
         # --- 3. idempotency + conflict whole-batch rejection ------------
         cell = "LIVE-IDEM"
         rows = [(0, 0), (10, 1.5), (20, 0), (30, -2.5), (40, 0)]
-        upload(c, cell, rows)
+        first = upload(c, cell, rows).json()
+        check(bool(first.get("batch_id")), "upload returns a batch id")
         r = upload(c, cell, rows)
         check(r.json()["inserted"] == 0 and r.json()["duplicate"] == 5,
               "identical re-upload is idempotent")
+        dup_batch = r.json()["batch_id"]
+        check(dup_batch != first["batch_id"],
+              "all-duplicate upload still gets its own batch id")
         before = c.get(f"{BASE}/cells/{cell}/report").json()
         r = upload(c, cell, [(10, 9.9), (99, 1)])
         check(r.status_code == 409, "different value at same ts -> 409")
@@ -75,7 +81,36 @@ def main():
         check(after["version"] == before["version"], "rejected batch keeps old version")
         check(after["total_cycles"] == before["total_cycles"], "old report unchanged")
 
-        # --- 4. concurrency: 8 writers, parallel readers ----------------
+        # --- 3b. batch revocation semantics -----------------------------
+        cell = "LIVE-REVOKE"
+        shared = [(0, 0), (10, 1)]
+        a = upload(c, cell, shared + [(20, 0), (30, -1), (40, 0)]).json()
+        b = upload(c, cell, shared + [(20, 0), (30, -2), (40, 0)])
+        check(b.status_code == 409, "conflicting duplicate is rejected")
+        b = upload(c, cell, shared).json()
+        check(b["duplicate"] == 2, "second batch shares two sample points")
+
+        rv = c.post(f"{BASE}/batches/{a['batch_id']}/revoke")
+        check(rv.status_code == 200, "revoke accepts a known batch id")
+        check(rv.json()["retained_samples"] == 2,
+              "shared sample survives while another batch backs it")
+        check(rv.json()["deleted_samples"] == 3, "unique samples are deleted")
+        rep = c.get(f"{BASE}/cells/{cell}/report").json()
+        check(rep["total_cycles"] == 0, "report recomputed after partial revoke")
+
+        again = c.post(f"{BASE}/batches/{a['batch_id']}/revoke").json()
+        check(again["already_revoked"] and again["version"] == rep["version"],
+              "repeat revoke does not change the report")
+        check(c.post(f"{BASE}/batches/no-such-batch/revoke").status_code == 404,
+              "unknown batch -> 404")
+
+        rv = c.post(f"{BASE}/batches/{b['batch_id']}/revoke").json()
+        check(rv["deleted_samples"] == 2, "last basis revoked deletes shared points")
+        rep = c.get(f"{BASE}/cells/{cell}/report").json()
+        check(rep["total_cycles"] == 0 and rep["cycles"] == [],
+              "empty sample set yields an empty report")
+
+        # --- 4. concurrency: 8 writers, 8 readers, 4 revokers -----------
         cell = "LIVE-CONC"
 
         def writer(n):
@@ -102,7 +137,7 @@ def main():
                         bad.append(rep)
             return bad
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
             f_w = [pool.submit(writer, n) for n in range(8)]
             f_r = [pool.submit(reader, n) for n in range(8)]
             codes = [f.result() for f in f_w]
@@ -111,6 +146,27 @@ def main():
         check(not inconsistencies, "every query saw one internally consistent state")
         final = c.get(f"{BASE}/cells/{cell}/report").json()
         check(final["total_cycles"] == 8, "final report contains all 8 cycles")
+
+        batches = c.get(f"{BASE}/cells/{cell}/batches").json()
+        check(len(batches) == 8, "every upload is listed as a batch")
+
+        # revoke four batches concurrently with readers; every observed
+        # report must still be internally consistent
+        def revoker(batch_id):
+            with httpx.Client(timeout=30) as rc:
+                return rc.post(f"{BASE}/batches/{batch_id}/revoke").status_code
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+            f_rv = [pool.submit(revoker, b["batch_id"]) for b in batches[:4]]
+            f_r2 = [pool.submit(reader, n) for n in range(8)]
+            rv_codes = [f.result() for f in f_rv]
+            inconsistencies = [x for f in f_r2 for x in f.result()]
+        check(rv_codes == [200] * 4, f"4 concurrent revokes succeeded (got {rv_codes})")
+        check(not inconsistencies, "queries consistent during concurrent revokes")
+        final = c.get(f"{BASE}/cells/{cell}/report").json()
+        check(final["total_cycles"] == 4, "four revoked cycles removed")
+        check([x["cycle_no"] for x in final["cycles"]] == [1, 2, 3, 4],
+              "cycle numbering recomputed 1..N")
 
         cells = c.get(f"{BASE}/cells").json()
         check(any(x["cell_id"] == cell for x in cells), "cell list endpoint")
